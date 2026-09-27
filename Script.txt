@@ -1,0 +1,2073 @@
+--[[
+    PRIMAL EARTH · v7.3
+    - v6.7: TPWalk conflict auto-recovery
+    - v7.0: Solid sky Safe Zone platform
+    - v7.1: Credits tab, UI-vanish fix
+    - v7.2: Auto Farm freeze state machine
+    - v7.3: ESP — single master toggle, all features baked in
+    - v7.3a: Auto TP to Safe Zone when HP < 10%
+    - Made by RADEN · Assisted by Grok
+]]
+
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local TweenService      = game:GetService("TweenService")
+local Workspace         = game:GetService("Workspace")
+
+local player    = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+for _, n in ipairs({"RATLAB_ESP","TPWalkHubESP"}) do
+    local o = playerGui:FindFirstChild(n)
+    if o then o:Destroy() end
+end
+
+--============================================================
+-- CONFIG
+--============================================================
+local ZONE_HOLD_TIME    = 15
+local ZONE_CHECK_TIME   = 0.5
+local GREEN_GRACE_TIME  = 1.0
+local TP_SETTLE_FRAMES  = 4
+
+local ZONE_DANGER_DIST      = 50
+local ZONE_DANGER_CHECK     = 0.5
+local SAFE_MONITOR_INTERVAL = 1.0
+
+local SAFE_STAND_TIME   = 15
+local SAFE_MIN_DIST     = 150
+local SAFE_SEARCH_TRIES = 40
+local SAFE_SEARCH_RANGE = 400
+local TP_OFFSET_Y       = 3
+
+local HUNGER_THRESHOLD  = 30
+local HUNGER_TARGET_SLIDER = 95
+local HUNGER_CHECK_TIME = 1.0
+local HUNGER_RETRY_WAIT = 1.5
+local EAT_MAX_TRIES     = 20
+local FULL_FRACTION     = 0.98
+
+-- Low HP → Safe Zone
+local LOW_HP_THRESHOLD_PERCENT = 10
+local LOW_HP_CHECK_TIME        = 0.25
+local LOW_HP_COOLDOWN          = 3.0
+
+local BUSH_KEYWORDS = {"bush", "berry", "tree", "fruit"}
+local ATTACHMENT_KEYWORDS = {
+    "actionattachment_leaf", "actionattachmentmeat",
+    "actionattachment_leaf_meat",
+    "actionattachmentleaf", "actionattachmentmeat",
+}
+
+local INDICATOR_NAMES = {"gradientcylinder", "innercylinder", "sensor", "lightcore"}
+local GREEN_MIN_G = 0.55
+local GREEN_RATIO = 1.3
+
+-- TPWalk
+local enabled    = false
+local value      = 5
+local connection = nil
+
+local tpToolOn   = false
+local tpToolConn = nil
+local TP_TOOL_THRESHOLD = 14
+local lastTapAt  = 0
+local TAP_SUPPRESS = 0.15
+
+-- Follow
+local followEnabled     = false
+local followTarget      = nil
+local followDistance    = 6
+local followMaxInstant  = 40
+local followLoopThread  = nil
+local followDebug       = false
+
+-- ESP (single master switch, all features baked in)
+local espOn    = false
+local espConn  = nil
+local espObjects = {}
+local espShowLocal = false
+local espTeamOnly  = false
+
+local FILL_TRANSPARENCY  = 0.75
+local HP_BAR_WIDTH       = 3
+local HP_BAR_OFFSET      = 8
+local TRACER_ORIGIN      = Vector2.new(0.5, 1.0)
+local MAX_TRACER_DIST    = 500
+
+local COL_VISIBLE = Color3.fromRGB(60, 240, 120)
+local COL_BLOCKED = Color3.fromRGB(255, 60, 60)
+
+-- Safe Zone (Local · Solid)
+local SAFE_ZONE_NAME      = "RATLAB_SafeZone"
+local SAFE_ZONE_SKY_Y     = 10000
+local safeZonePart        = nil
+local safeZoneSize        = Vector3.new(5, 2, 5)
+local safeZoneFollowConn  = nil
+local safeZoneFollowOn    = false
+local lastGroundPos       = nil
+
+--============================================================
+-- STATE
+--============================================================
+local farming    = false
+local farmThread = nil
+local hungerWatch  = false
+local hungerThread = nil
+local eatBusy      = false
+
+local lowHpWatch   = false
+local lowHpThread  = nil
+local lowHpBusy    = false
+local lastLowHpTP  = 0
+
+local frozen       = false
+local frozenCF     = nil
+local lockConn     = nil
+local savedSpeed   = nil
+local savedJumpPow = nil
+local savedJumpH   = nil
+
+local hungerRef    = nil
+local maxHungerRef = nil
+local cachedMaxHunger = nil
+local debugHunger  = false
+
+local inDangerMode = false
+local tpwalkWasEnabledBeforeConflict = false
+
+--============================================================
+-- ESP GUI (namespaced)
+--============================================================
+local espGui = Instance.new("ScreenGui")
+espGui.Name = "TPWalkHubESP"
+espGui.ResetOnSpawn = false
+espGui.IgnoreGuiInset = true
+espGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+espGui.DisplayOrder = 5
+espGui.Parent = playerGui
+
+local espHolder = Instance.new("Frame")
+espHolder.Name = "ESPHolder"
+espHolder.BackgroundTransparency = 1
+espHolder.Size = UDim2.new(1, 0, 1, 0)
+espHolder.Position = UDim2.new(0, 0, 0, 0)
+espHolder.ZIndex = 1
+espHolder.Active = false
+espHolder.Parent = espGui
+
+--============================================================
+-- HELPERS
+--============================================================
+local function notify(title, content, dur)
+    Rayfield:Notify({ Title = title, Content = content, Duration = dur or 4, Image = 4483362458 })
+end
+
+local function dprint(...)
+    if debugHunger then print("[RAT LAB]", ...) end
+end
+
+local function fprint(...)
+    if followDebug then print("[FOLLOW]", ...) end
+end
+
+local function tprint(...)
+    print("[TPWALK]", ...)
+end
+
+local function getHRP()
+    local c = player.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHum()
+    local c = player.Character
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function getZonePosition(zone)
+    if not zone then return nil end
+    if zone:IsA("Model") then
+        if zone.PrimaryPart then return zone.PrimaryPart.Position end
+        local ok, pivot = pcall(function() return zone:GetPivot() end)
+        if ok then return pivot.Position end
+        for _, d in ipairs(zone:GetDescendants()) do
+            if d:IsA("BasePart") then return d.Position end
+        end
+    elseif zone:IsA("BasePart") then
+        return zone.Position
+    end
+    return nil
+end
+
+local function rawTP(pos)
+    local hrp = getHRP()
+    if not hrp or not pos then return false end
+    hrp.CFrame = CFrame.new(pos + Vector3.new(0, TP_OFFSET_Y, 0))
+    return true
+end
+
+--============================================================
+-- TPWalk Core
+--============================================================
+local function tpwalk(dt)
+    if tick() - lastTapAt < TAP_SUPPRESS then return end
+    local char = player.Character
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not hum or not root then return end
+    if hum.Health <= 0 then return end
+    if root.Anchored then
+        pcall(function() root.Anchored = false end)
+    end
+    local mv = hum.MoveDirection
+    if mv.Magnitude < 0.01 then return end
+    local dir = Vector3.new(mv.X, 0, mv.Z).Unit
+    local step = dir * (value * 10 * dt)
+    local look = root.CFrame.LookVector
+    local newPos = root.Position + step
+    root.CFrame = CFrame.lookAt(newPos, newPos + look)
+end
+
+local function tpwalkConnect()
+    if not connection then
+        connection = RunService.Heartbeat:Connect(tpwalk)
+        tprint("connected")
+    end
+end
+
+local function tpwalkDisconnect()
+    if connection then
+        connection:Disconnect()
+        connection = nil
+        tprint("disconnected")
+    end
+end
+
+local function setEnabled(state)
+    enabled = state
+    if enabled then
+        tpwalkConnect()
+        if frozen then unfreezePlayer() end
+    else
+        tpwalkDisconnect()
+    end
+end
+
+--============================================================
+-- FREEZE
+--============================================================
+local function startLockLoop()
+    if lockConn then lockConn:Disconnect() end
+    lockConn = RunService.Heartbeat:Connect(function()
+        if not frozen then return end
+        if enabled then return end
+        if followEnabled then return end
+        local r = getHRP(); if not r then return end
+        if not r.Anchored then pcall(function() r.Anchored = true end) end
+        if frozenCF and (r.Position - frozenCF.Position).Magnitude > 1 then r.CFrame = frozenCF end
+        local h = getHum()
+        if h then h.WalkSpeed = 0; h.JumpPower = 0; h.JumpHeight = 0 end
+    end)
+end
+
+local function freezePlayer()
+    if frozen then return end
+    if enabled or followEnabled then return end
+    local hum = getHum(); local hrp = getHRP()
+    if not hum or not hrp then return end
+    savedSpeed   = hum.WalkSpeed
+    savedJumpPow = hum.JumpPower
+    savedJumpH   = hum.JumpHeight
+    hum.WalkSpeed = 0; hum.JumpPower = 0; hum.JumpHeight = 0
+    pcall(function() hum.UseJumpPower = true; hum.JumpPower = 0 end)
+    frozenCF = hrp.CFrame
+    pcall(function() hrp.Anchored = true end)
+    frozen = true
+    startLockLoop()
+end
+
+local function unfreezePlayer()
+    if lockConn then lockConn:Disconnect(); lockConn = nil end
+    frozen = false; frozenCF = nil
+    local hrp = getHRP()
+    if hrp then pcall(function() hrp.Anchored = false end) end
+    local hum = getHum()
+    if hum then
+        if savedSpeed   then hum.WalkSpeed  = savedSpeed   end
+        if savedJumpPow then hum.JumpPower  = savedJumpPow end
+        if savedJumpH   then hum.JumpHeight = savedJumpH   end
+        if enabled and hum.WalkSpeed == 0 then
+            hum.WalkSpeed = 16
+        end
+    end
+    savedSpeed, savedJumpPow, savedJumpH = nil, nil, nil
+end
+
+local function goTo(pos)
+    if not pos then return false end
+    unfreezePlayer()
+    for _ = 1, 2 do RunService.Heartbeat:Wait() end
+    rawTP(pos)
+    RunService.Heartbeat:Wait()
+    rawTP(pos)
+    for _ = 1, TP_SETTLE_FRAMES do RunService.Heartbeat:Wait() end
+    freezePlayer()
+    return true
+end
+
+--============================================================
+-- CONFLICT RESOLVER
+--============================================================
+local function enterConflictMode(reason)
+    tprint("enter conflict (" .. (reason or "?") .. ")")
+    tpwalkWasEnabledBeforeConflict = enabled
+    if enabled then
+        tpwalkDisconnect()
+        tprint("tpwalk paused for conflict")
+    end
+    if frozen then unfreezePlayer() end
+end
+
+local function exitConflictMode()
+    tprint("exit conflict")
+    if tpwalkWasEnabledBeforeConflict then
+        enabled = true
+        tpwalkConnect()
+        tprint("tpwalk restored")
+        notify("PRIMAL EARTH", "TPWalk restored", 3)
+    end
+    tpwalkWasEnabledBeforeConflict = false
+    if frozen then unfreezePlayer() end
+end
+
+--============================================================
+-- FOLLOW
+--============================================================
+local function isTargetFlying(hrp, hum)
+    if not hrp then return false end
+    if hum then
+        local ok, state = pcall(function() return hum:GetState() end)
+        if ok then
+            if state == Enum.HumanoidStateType.Freefall
+               or state == Enum.HumanoidStateType.Flying
+               or state == Enum.HumanoidStateType.PlatformStanding then
+                return true
+            end
+        end
+    end
+    local ok2, vel = pcall(function()
+        return hrp.AssemblyLinearVelocity or hrp.Velocity
+    end)
+    if ok2 and vel then
+        if math.abs(vel.Y) > 5 then return true end
+    end
+    if hrp.Position.Y > 200 then return true end
+    return false
+end
+
+local function computeFollowCF(targetHRP)
+    if not targetHRP then return nil end
+    local targetPos = targetHRP.Position
+    local targetLook = targetHRP.CFrame.LookVector
+    if targetLook.Magnitude < 0.01 then
+        targetLook = Vector3.new(0, 0, 1)
+    end
+    local dest = targetPos - targetLook * followDistance
+    return CFrame.lookAt(dest, targetPos)
+end
+
+local function followLoop()
+    fprint("follow loop started")
+    while followEnabled do
+        task.wait(0.03)
+        if not followTarget then
+            task.wait(0.3)
+        else
+            if not followTarget.Parent then
+                notify("PRIMAL EARTH", "Target left", 3)
+                followEnabled = false
+                followTarget = nil
+                break
+            end
+            local targetChar = followTarget.Character
+            if not targetChar then
+                task.wait(0.5)
+            else
+                local targetHRP = targetChar:FindFirstChild("HumanoidRootPart")
+                local targetHum = targetChar:FindFirstChildOfClass("Humanoid")
+                if not targetHRP then
+                    task.wait(0.5)
+                else
+                    local myChar = player.Character
+                    local myHRP = myChar and myChar:FindFirstChild("HumanoidRootPart")
+                    if not myHRP then
+                        task.wait(0.5)
+                    elseif followTarget == player then
+                        task.wait(0.3)
+                    else
+                        local destCF = computeFollowCF(targetHRP)
+                        if destCF then
+                            local myPos = myHRP.Position
+                            local distToDest = (destCF.Position - myPos).Magnitude
+                            local flying = isTargetFlying(targetHRP, targetHum)
+                            local tooFar = distToDest > followMaxInstant
+                            if flying or tooFar then
+                                local duration = math.clamp(distToDest / 150, 0.08, 0.4)
+                                local tw = TweenService:Create(
+                                    myHRP,
+                                    TweenInfo.new(duration, Enum.EasingStyle.Linear),
+                                    { CFrame = destCF }
+                                )
+                                tw:Play()
+                                fprint(string.format("tween dist=%.1f dur=%.2f fly=%s",
+                                    distToDest, duration, tostring(flying)))
+                            else
+                                myHRP.CFrame = destCF
+                                fprint(string.format("instant dist=%.1f", distToDest))
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    fprint("follow loop stopped")
+end
+
+local function startFollow(targetPlr)
+    if not targetPlr then return end
+    if targetPlr == player then
+        notify("PRIMAL EARTH", "Tidak bisa follow diri sendiri", 3)
+        return
+    end
+    if farming then
+        farming = false
+        inDangerMode = false
+        if farmThread then task.cancel(farmThread); farmThread = nil end
+    end
+    enterConflictMode("follow")
+    followTarget = targetPlr
+    followEnabled = true
+    if not followLoopThread then
+        followLoopThread = task.spawn(function()
+            followLoop()
+            followLoopThread = nil
+            exitConflictMode()
+        end)
+    end
+    notify("PRIMAL EARTH", "Following: " .. targetPlr.DisplayName, 3)
+end
+
+local function stopFollow()
+    if not followEnabled then return end
+    followEnabled = false
+    followTarget = nil
+    notify("PRIMAL EARTH", "Follow stopped", 3)
+end
+
+--============================================================
+-- TP TOOL
+--============================================================
+local function enableTPTool()
+    if tpToolConn then tpToolConn:Disconnect() tpToolConn = nil end
+    local pending = nil
+    local connBegan = UserInputService.InputBegan:Connect(function(input, gpe)
+        if gpe then return end
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            pending = {
+                startPos = Vector2.new(input.Position.X, input.Position.Y),
+                inputType = input.UserInputType,
+            }
+        end
+    end)
+    local connEnded = UserInputService.InputEnded:Connect(function(input)
+        if not pending then return end
+        if input.UserInputType ~= pending.inputType then return end
+        local endPos = Vector2.new(input.Position.X, input.Position.Y)
+        local moved = (endPos - pending.startPos).Magnitude
+        lastTapAt = tick()
+        if moved <= TP_TOOL_THRESHOLD then
+            local char = player.Character
+            if char then
+                local hrp = char:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    local cam = Workspace.CurrentCamera
+                    if cam then
+                        local unitRay = cam:ScreenPointToRay(endPos.X, endPos.Y)
+                        local params = RaycastParams.new()
+                        params.FilterType = Enum.RaycastFilterType.Exclude
+                        params.FilterDescendantsInstances = {char}
+                        local result = Workspace:Raycast(unitRay.Origin, unitRay.Direction * 1000, params)
+                        if result then
+                            if frozen then unfreezePlayer(); task.wait(0.05) end
+                            hrp.CFrame = CFrame.new(result.Position + Vector3.new(0, 3, 0))
+                        end
+                    end
+                end
+            end
+        end
+        pending = nil
+    end)
+    tpToolConn = {
+        Disconnect = function()
+            connBegan:Disconnect()
+            connEnded:Disconnect()
+        end,
+    }
+end
+
+local function disableTPTool()
+    if tpToolConn then
+        tpToolConn:Disconnect()
+        tpToolConn = nil
+    end
+end
+
+--============================================================
+-- ESP (FULL — all features always on when enabled)
+--============================================================
+local function isEspTarget(plr)
+    if plr == player and not espShowLocal then return false end
+    local char = plr.Character
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return false end
+    if espTeamOnly and player.Team and plr.Team and player.Team == plr.Team then
+        return false
+    end
+    return true
+end
+
+local function espVisible(char, head)
+    local cam = Workspace.CurrentCamera
+    if not cam then return false end
+    local origin = cam.CFrame.Position
+    local dir = head.Position - origin
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {player.Character, cam, char}
+    local hit = Workspace:Raycast(origin, dir, params)
+    return hit == nil
+end
+
+local function newCorner(parent)
+    local f = Instance.new("Frame")
+    f.Name = "RATLAB_Corner"
+    f.BackgroundColor3 = COL_BLOCKED
+    f.BorderSizePixel = 0
+    f.ZIndex = 3
+    f.Parent = parent
+    return f
+end
+
+local function createEspFor(plr)
+    if espObjects[plr] then return end
+    local char = plr.Character
+    if not char then return end
+
+    local glow = Instance.new("Highlight")
+    glow.Name = "RATLAB_Glow"
+    glow.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    glow.FillTransparency = 1
+    glow.OutlineTransparency = 0.35
+    glow.OutlineColor = COL_BLOCKED
+    glow.Adornee = char
+    glow.Parent = char
+
+    local hl = Instance.new("Highlight")
+    hl.Name = "RATLAB_Core"
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    hl.FillTransparency = FILL_TRANSPARENCY
+    hl.OutlineTransparency = 0
+    hl.FillColor = COL_BLOCKED
+    hl.OutlineColor = COL_BLOCKED
+    hl.Adornee = char
+    hl.Parent = char
+
+    local name = Instance.new("TextLabel")
+    name.Name = "RATLAB_Name"
+    name.BackgroundTransparency = 1
+    name.TextColor3 = Color3.fromRGB(255, 255, 255)
+    name.Font = Enum.Font.GothamBold
+    name.TextSize = 11
+    name.TextStrokeTransparency = 0.2
+    name.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+    name.ZIndex = 3
+    name.Parent = espHolder
+
+    local dist = Instance.new("TextLabel")
+    dist.Name = "RATLAB_Dist"
+    dist.BackgroundTransparency = 1
+    dist.TextColor3 = Color3.fromRGB(220, 220, 220)
+    dist.Font = Enum.Font.Gotham
+    dist.TextSize = 10
+    dist.TextStrokeTransparency = 0.2
+    dist.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+    dist.ZIndex = 3
+    dist.Parent = espHolder
+
+    local hpBg = Instance.new("Frame")
+    hpBg.Name = "RATLAB_HpBg"
+    hpBg.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+    hpBg.BackgroundTransparency = 0.35
+    hpBg.BorderSizePixel = 0
+    hpBg.ZIndex = 2
+    hpBg.Parent = espHolder
+    local bgc = Instance.new("UICorner", hpBg)
+    bgc.CornerRadius = UDim.new(1, 0)
+
+    local hpFill = Instance.new("Frame")
+    hpFill.Name = "RATLAB_HpFill"
+    hpFill.BackgroundColor3 = Color3.fromRGB(60, 240, 120)
+    hpFill.BorderSizePixel = 0
+    hpFill.Size = UDim2.new(1, 0, 1, 0)
+    hpFill.ZIndex = 3
+    hpFill.Parent = hpBg
+    local hfc = Instance.new("UICorner", hpFill)
+    hfc.CornerRadius = UDim.new(1, 0)
+
+    local tracer = Instance.new("Frame")
+    tracer.Name = "RATLAB_Tracer"
+    tracer.BackgroundColor3 = COL_BLOCKED
+    tracer.BorderSizePixel = 0
+    tracer.AnchorPoint = Vector2.new(0.5, 0.5)
+    tracer.ZIndex = 1
+    tracer.Parent = espHolder
+    local tc = Instance.new("UICorner", tracer)
+    tc.CornerRadius = UDim.new(1, 0)
+
+    local cornerHolder = Instance.new("Frame")
+    cornerHolder.Name = "RATLAB_CornerHolder"
+    cornerHolder.BackgroundTransparency = 1
+    cornerHolder.ZIndex = 2
+    cornerHolder.Parent = espHolder
+
+    local corners = {
+        tl_h = newCorner(cornerHolder), tl_v = newCorner(cornerHolder),
+        tr_h = newCorner(cornerHolder), tr_v = newCorner(cornerHolder),
+        bl_h = newCorner(cornerHolder), bl_v = newCorner(cornerHolder),
+        br_h = newCorner(cornerHolder), br_v = newCorner(cornerHolder),
+    }
+
+    local dot = Instance.new("Frame")
+    dot.Name = "RATLAB_HeadDot"
+    dot.BackgroundColor3 = COL_BLOCKED
+    dot.BorderSizePixel = 0
+    dot.AnchorPoint = Vector2.new(0.5, 0.5)
+    dot.Size = UDim2.new(0, 6, 0, 6)
+    dot.Rotation = 45
+    dot.ZIndex = 3
+    dot.Parent = espHolder
+    local dc = Instance.new("UICorner", dot)
+    dc.CornerRadius = UDim.new(0, 2)
+
+    espObjects[plr] = {
+        hl = hl, glow = glow,
+        name = name, dist = dist,
+        hpBg = hpBg, hpFill = hpFill,
+        tracer = tracer,
+        corners = corners, cornerHolder = cornerHolder,
+        dot = dot,
+    }
+end
+
+local function removeEspFor(plr)
+    local o = espObjects[plr]
+    if not o then return end
+    for _, k in ipairs({"hl","glow","name","dist","hpBg","tracer","cornerHolder","dot"}) do
+        if o[k] and o[k].Parent then o[k]:Destroy() end
+    end
+    if o.corners then
+        for _, c in pairs(o.corners) do
+            if c and c.Parent then c:Destroy() end
+        end
+    end
+    espObjects[plr] = nil
+end
+
+local function clearAllEsp()
+    for plr in pairs(espObjects) do removeEspFor(plr) end
+end
+
+local function reAdornEsp(plr)
+    local o = espObjects[plr]
+    if not o then return end
+    local char = plr.Character
+    if not char then return end
+    if o.hl then
+        if o.hl.Adornee ~= char then o.hl.Adornee = char end
+        if o.hl.Parent ~= char then o.hl.Parent = char end
+    end
+    if o.glow then
+        if o.glow.Adornee ~= char then o.glow.Adornee = char end
+        if o.glow.Parent ~= char then o.glow.Parent = char end
+    end
+end
+
+local function updateEsp()
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+    local vp = cam.ViewportSize
+    local tracerOrigin = Vector2.new(vp.X * TRACER_ORIGIN.X, vp.Y * TRACER_ORIGIN.Y)
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if not isEspTarget(plr) then
+            removeEspFor(plr)
+        else
+            local char = plr.Character
+            local head = char and char:FindFirstChild("Head")
+            local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+            local hum  = char and char:FindFirstChildOfClass("Humanoid")
+
+            if head and hrp and hum then
+                createEspFor(plr)
+                reAdornEsp(plr)
+                local o = espObjects[plr]
+
+                local visible = espVisible(char, head)
+                local baseCol = visible and COL_VISIBLE or COL_BLOCKED
+
+                if o.hl then
+                    o.hl.FillColor = baseCol
+                    o.hl.OutlineColor = baseCol
+                end
+                if o.glow then o.glow.OutlineColor = baseCol end
+                o.tracer.BackgroundColor3 = baseCol
+                o.dot.BackgroundColor3 = baseCol
+                for _, c in pairs(o.corners) do c.BackgroundColor3 = baseCol end
+
+                local distVal = (cam.CFrame.Position - hrp.Position).Magnitude
+                local headTop    = head.Position + Vector3.new(0, head.Size.Y * 0.5, 0)
+                local footBottom = hrp.Position  - Vector3.new(0, hrp.Size.Y * 0.5 + (hum.HipHeight or 2), 0)
+
+                local hp, onH = cam:WorldToViewportPoint(headTop)
+                local fp, onF = cam:WorldToViewportPoint(footBottom)
+                local hpt, onT = cam:WorldToViewportPoint(head.Position)
+
+                if onH and onF and onT then
+                    local topY = math.min(hp.Y, fp.Y)
+                    local botY = math.max(hp.Y, fp.Y)
+                    local h = botY - topY
+                    local w = h * 0.6
+                    local leftX = hpt.X - w / 2
+                    local rightX = hpt.X + w / 2
+
+                    o.name.Visible = true
+                    o.dist.Visible = true
+                    o.name.Position = UDim2.new(0, hpt.X - 60, 0, topY - 28)
+                    o.name.Size     = UDim2.new(0, 120, 0, 14)
+                    o.name.Text     = plr.DisplayName
+
+                    o.dist.Position = UDim2.new(0, hpt.X - 60, 0, topY - 16)
+                    o.dist.Size     = UDim2.new(0, 120, 0, 12)
+                    o.dist.Text     = string.format("%d studs", math.floor(distVal))
+
+                    local hpFrac = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+                    local barH = h * 0.9
+                    local xLeft = leftX - HP_BAR_OFFSET - HP_BAR_WIDTH
+
+                    o.hpBg.Visible = true
+                    o.hpBg.Position = UDim2.new(0, xLeft, 0, topY + h * 0.05)
+                    o.hpBg.Size = UDim2.new(0, HP_BAR_WIDTH, 0, barH)
+                    o.hpFill.Size = UDim2.new(1, 0, hpFrac, 0)
+                    o.hpFill.Position = UDim2.new(0, 0, 1 - hpFrac, 0)
+
+                    local hpCol = hpFrac > 0.5 and Color3.fromRGB(80, 240, 120)
+                               or hpFrac > 0.25 and Color3.fromRGB(240, 200, 60)
+                               or Color3.fromRGB(255, 60, 60)
+                    o.hpFill.BackgroundColor3 = hpCol
+
+                    local target = Vector2.new(hpt.X, hpt.Y)
+                    local delta = target - tracerOrigin
+                    local len = delta.Magnitude
+                    local mid = (tracerOrigin + target) / 2
+                    local angle = math.deg(math.atan2(delta.Y, delta.X))
+                    local alpha = math.clamp(1 - distVal / MAX_TRACER_DIST, 0.15, 1)
+                    o.tracer.Visible = true
+                    o.tracer.Position = UDim2.new(0, mid.X, 0, mid.Y)
+                    o.tracer.Size = UDim2.new(0, len, 0, 1)
+                    o.tracer.Rotation = angle
+                    o.tracer.BackgroundTransparency = 1 - alpha
+
+                    o.cornerHolder.Visible = true
+                    local cornerLen = math.min(h * 0.2, 14)
+                    local thick = 2
+                    local c = o.corners
+                    c.tl_h.Position = UDim2.new(0, leftX, 0, topY)
+                    c.tl_h.Size = UDim2.new(0, cornerLen, 0, thick)
+                    c.tl_v.Position = UDim2.new(0, leftX, 0, topY)
+                    c.tl_v.Size = UDim2.new(0, thick, 0, cornerLen)
+                    c.tr_h.Position = UDim2.new(0, rightX - cornerLen, 0, topY)
+                    c.tr_h.Size = UDim2.new(0, cornerLen, 0, thick)
+                    c.tr_v.Position = UDim2.new(0, rightX - thick, 0, topY)
+                    c.tr_v.Size = UDim2.new(0, thick, 0, cornerLen)
+                    c.bl_h.Position = UDim2.new(0, leftX, 0, botY - thick)
+                    c.bl_h.Size = UDim2.new(0, cornerLen, 0, thick)
+                    c.bl_v.Position = UDim2.new(0, leftX, 0, botY - cornerLen)
+                    c.bl_v.Size = UDim2.new(0, thick, 0, cornerLen)
+                    c.br_h.Position = UDim2.new(0, rightX - cornerLen, 0, botY - thick)
+                    c.br_h.Size = UDim2.new(0, cornerLen, 0, thick)
+                    c.br_v.Position = UDim2.new(0, rightX - thick, 0, botY - cornerLen)
+                    c.br_v.Size = UDim2.new(0, thick, 0, cornerLen)
+
+                    o.dot.Visible = true
+                    o.dot.Position = UDim2.new(0, hpt.X, 0, topY - 8)
+                else
+                    o.name.Visible = false
+                    o.dist.Visible = false
+                    o.hpBg.Visible = false
+                    o.tracer.Visible = false
+                    o.cornerHolder.Visible = false
+                    o.dot.Visible = false
+                end
+            else
+                removeEspFor(plr)
+            end
+        end
+    end
+end
+
+local function startEsp()
+    if espConn then return end
+    espConn = RunService.RenderStepped:Connect(updateEsp)
+end
+
+local function stopEsp()
+    if espConn then espConn:Disconnect(); espConn = nil end
+    clearAllEsp()
+end
+
+--============================================================
+-- HUNGER
+--============================================================
+local function isValidNumObj(obj)
+    return obj and (obj:IsA("IntValue") or obj:IsA("NumberValue"))
+end
+
+local function tryReadNumber(obj)
+    if not obj then return nil end
+    if isValidNumObj(obj) then
+        local ok, v = pcall(function() return obj.Value end)
+        if ok and typeof(v) == "number" then return v end
+    end
+    return nil
+end
+
+local function findHungerValue()
+    if hungerRef and hungerRef.Parent and isValidNumObj(hungerRef) then
+        return hungerRef
+    end
+    hungerRef = nil
+    local sf = player:FindFirstChild("StatsFolder")
+    if sf then
+        local h = sf:FindFirstChild("Hunger")
+        if isValidNumObj(h) then hungerRef = h; return h end
+    end
+    for _, obj in ipairs(player:GetChildren()) do
+        if obj.Name:lower():find("hunger", 1, true) and isValidNumObj(obj) then
+            hungerRef = obj; return obj
+        end
+    end
+    for _, obj in ipairs(player:GetDescendants()) do
+        if obj.Name:lower():find("hunger", 1, true) and isValidNumObj(obj) then
+            hungerRef = obj; return obj
+        end
+    end
+    local char = player.Character
+    if char then
+        for _, obj in ipairs(char:GetDescendants()) do
+            if obj.Name:lower():find("hunger", 1, true) and isValidNumObj(obj) then
+                hungerRef = obj; return obj
+            end
+        end
+    end
+    local ls = player:FindFirstChild("leaderstats")
+    if ls then
+        for _, obj in ipairs(ls:GetDescendants()) do
+            if obj.Name:lower():find("hunger", 1, true) and isValidNumObj(obj) then
+                hungerRef = obj; return obj
+            end
+        end
+    end
+    return nil
+end
+
+local function findMaxHungerValue()
+    if maxHungerRef and maxHungerRef.Parent and isValidNumObj(maxHungerRef) then
+        return maxHungerRef
+    end
+    maxHungerRef = nil
+    local hunger = hungerRef or findHungerValue()
+    if hunger and hunger.Parent then
+        local p = hunger.Parent
+        for _, obj in ipairs(p:GetChildren()) do
+            local n = obj.Name:lower()
+            if isValidNumObj(obj) and (n:find("maxhunger", 1, true) or n:find("hungermax", 1, true)
+               or (n:find("max", 1, true) and n:find("hunger", 1, true))) then
+                maxHungerRef = obj; return obj
+            end
+        end
+    end
+    local sf = player:FindFirstChild("StatsFolder")
+    if sf then
+        for _, obj in ipairs(sf:GetChildren()) do
+            local n = obj.Name:lower()
+            if isValidNumObj(obj) and (n:find("maxhunger", 1, true) or n:find("hungermax", 1, true)) then
+                maxHungerRef = obj; return obj
+            end
+        end
+    end
+    for _, obj in ipairs(player:GetDescendants()) do
+        if isValidNumObj(obj) then
+            local n = obj.Name:lower()
+            if n:find("maxhunger", 1, true) or n:find("hungermax", 1, true) then
+                maxHungerRef = obj; return obj
+            end
+        end
+    end
+    return nil
+end
+
+local function readHunger()
+    local h = findHungerValue()
+    if not h then return nil end
+    return tryReadNumber(h)
+end
+
+local function readMaxHunger()
+    if cachedMaxHunger then return cachedMaxHunger end
+    local m = findMaxHungerValue()
+    if m then
+        local v = tryReadNumber(m)
+        if v and v > 0 then
+            cachedMaxHunger = v
+            dprint("MaxHunger detected = " .. tostring(v))
+            return v
+        end
+    end
+    return HUNGER_TARGET_SLIDER
+end
+
+--============================================================
+-- BUSH + EAT
+--============================================================
+local function isBushModel(obj)
+    if not obj:IsA("Model") then return false end
+    local n = obj.Name:lower()
+    for _, kw in ipairs(BUSH_KEYWORDS) do
+        if n:find(kw, 1, true) then return true end
+    end
+    return false
+end
+
+local function hasAttachment(model)
+    if not model then return nil end
+    for _, obj in ipairs(model:GetDescendants()) do
+        local n = obj.Name:lower()
+        for _, key in ipairs(ATTACHMENT_KEYWORDS) do
+            if n:find(key, 1, true) then return obj end
+        end
+    end
+    return nil
+end
+
+local function findNearestBush()
+    local hrp = getHRP(); if not hrp then return nil end
+    local myPos = hrp.Position
+    local candidates = {}
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if isBushModel(obj) then
+            local att = hasAttachment(obj)
+            if att then
+                local pos = getZonePosition(obj)
+                if pos then table.insert(candidates, {model = obj, att = att, pos = pos}) end
+            end
+        end
+    end
+    if #candidates == 0 then
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            local n = obj.Name:lower()
+            for _, key in ipairs(ATTACHMENT_KEYWORDS) do
+                if n:find(key, 1, true) then
+                    local pos
+                    if obj:IsA("BasePart") then pos = obj.Position
+                    elseif obj:IsA("Attachment") then pos = obj.WorldPosition end
+                    if pos then table.insert(candidates, {model = obj, att = obj, pos = pos}) end
+                    break
+                end
+            end
+        end
+    end
+    local best, bestDist = nil, math.huge
+    for _, c in ipairs(candidates) do
+        local d = (c.pos - myPos).Magnitude
+        if d < bestDist then bestDist = d; best = c end
+    end
+    return best
+end
+
+local function fireEatAt(entry)
+    if not entry then return false end
+    local model = entry.model
+    if not model or not model.Parent then return false end
+    local fired = 0
+    for _, obj in ipairs(model:GetDescendants()) do
+        if obj:IsA("ProximityPrompt") then
+            local n = obj.Name:lower()
+            if n:find("eat", 1, true) then
+                local ok = pcall(function() fireproximityprompt(obj) end)
+                if ok then fired = fired + 1 end
+            end
+        end
+    end
+    if fired == 0 then
+        for _, obj in ipairs(model:GetDescendants()) do
+            if obj:IsA("ProximityPrompt") then
+                local ok = pcall(function() fireproximityprompt(obj) end)
+                if ok then fired = fired + 1 end
+            end
+        end
+    end
+    local att = entry.att
+    if typeof(firetouchinterest) == "function" and att and att:IsA("BasePart") then
+        local char = player.Character
+        if char then
+            for _, bp in ipairs(char:GetDescendants()) do
+                if bp:IsA("BasePart") then
+                    pcall(function()
+                        firetouchinterest(bp, att, 0)
+                        task.wait(0.03)
+                        firetouchinterest(bp, att, 1)
+                    end)
+                end
+            end
+        end
+    end
+    return fired > 0
+end
+
+local function eatUntilFull()
+    local startHunger = readHunger()
+    if not startHunger then
+        notify("PRIMAL EARTH", "Cannot read hunger", 4)
+        return false
+    end
+    local target = readMaxHunger()
+    local fullThreshold = target * FULL_FRACTION
+    if startHunger >= fullThreshold then
+        notify("PRIMAL EARTH", "Already full", 3)
+        return false
+    end
+    if eatBusy then return false end
+    eatBusy = true
+    local wasFrozen = frozen
+    unfreezePlayer()
+    local tries = 0
+    while tries < EAT_MAX_TRIES do
+        tries = tries + 1
+        cachedMaxHunger = nil
+        local lastTarget = readMaxHunger()
+        local fullAt = lastTarget * FULL_FRACTION
+        local h = readHunger()
+        if not h then break end
+        if h >= fullAt then
+            notify("PRIMAL EARTH", string.format("Full · %d/%d", math.floor(h), math.floor(lastTarget)), 3)
+            break
+        end
+        local bush = findNearestBush()
+        if not bush then
+            notify("PRIMAL EARTH", "No bush found", 3)
+            break
+        end
+        rawTP(bush.pos)
+        RunService.Heartbeat:Wait()
+        rawTP(bush.pos)
+        for _ = 1, 3 do RunService.Heartbeat:Wait() end
+        fireEatAt(bush)
+        task.wait(HUNGER_RETRY_WAIT)
+    end
+    if wasFrozen and farming and not enabled and not followEnabled then freezePlayer() end
+    eatBusy = false
+    return true
+end
+
+local function hungerLoop()
+    while hungerWatch do
+        local ok, h = pcall(readHunger)
+        if not ok then h = nil end
+        if h == nil then
+            hungerRef = nil; maxHungerRef = nil; cachedMaxHunger = nil
+        else
+            local max = readMaxHunger()
+            if h < HUNGER_THRESHOLD and not eatBusy then
+                notify("PRIMAL EARTH", string.format("Hunger %d/%d · eating", math.floor(h), math.floor(max)), 3)
+                eatUntilFull()
+            end
+        end
+        task.wait(HUNGER_CHECK_TIME)
+    end
+end
+
+--============================================================
+-- ZONE COLOR
+--============================================================
+local function isGreenColor(c)
+    if not c then return false end
+    return c.G >= GREEN_MIN_G and c.G > c.R * GREEN_RATIO and c.G > c.B * GREEN_RATIO
+end
+
+local function checkZoneState(zone)
+    if not zone then return "unknown" end
+    local foundAny = false
+    local allGreen = true
+    for _, obj in ipairs(zone:GetDescendants()) do
+        local lower = obj.Name:lower()
+        local matched = false
+        for _, key in ipairs(INDICATOR_NAMES) do
+            if lower:find(key, 1, true) then matched = true; break end
+        end
+        if matched and obj:IsA("BasePart") then
+            foundAny = true
+            if not isGreenColor(obj.Color) then allGreen = false end
+        end
+    end
+    if not foundAny then return "unknown" end
+    return allGreen and "green" or "red"
+end
+
+local function getZonesFolder()
+    for _, obj in ipairs(Workspace:GetChildren()) do
+        if obj:IsA("Folder") and obj.Name:lower() == "zones" then return obj end
+    end
+    for _, obj in ipairs(Workspace:GetChildren()) do
+        if obj:IsA("Folder") and obj.Name:lower():find("zone", 1, true) then return obj end
+    end
+    return nil
+end
+
+local function getAllZones()
+    local zones = {}
+    local folder = getZonesFolder()
+    if folder then
+        for _, obj in ipairs(folder:GetChildren()) do
+            if obj:IsA("Model") then table.insert(zones, obj) end
+        end
+    end
+    if #zones == 0 then
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            if obj:IsA("Model") and obj.Name:lower() == "zone" then
+                table.insert(zones, obj)
+            end
+        end
+    end
+    return zones
+end
+
+local isAllZonesClear
+
+local function isZoneDangerous(pos)
+    if not pos then return false, nil, math.huge end
+    local nearest, nearestDist = nil, math.huge
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= player then
+            local char = plr.Character
+            if char then
+                local hrp = char:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    local d = (hrp.Position - pos).Magnitude
+                    if d < nearestDist then
+                        nearestDist = d
+                        nearest = plr
+                    end
+                end
+            end
+        end
+    end
+    return nearestDist <= ZONE_DANGER_DIST, nearest, nearestDist
+end
+
+isAllZonesClear = function()
+    for _, zone in ipairs(getAllZones()) do
+        local pos = getZonePosition(zone)
+        if pos then
+            local danger = isZoneDangerous(pos)
+            if danger then return false end
+        end
+    end
+    return true
+end
+
+local function findSafeSpot()
+    local zones = getAllZones()
+    local center
+    if #zones > 0 then
+        local sum, count = Vector3.new(0,0,0), 0
+        for _, z in ipairs(zones) do
+            local p = getZonePosition(z)
+            if p then sum = sum + p; count = count + 1 end
+        end
+        center = count > 0 and (sum / count) or Vector3.new(0, 50, 0)
+    else
+        local spawn = Workspace:FindFirstChildOfClass("SpawnLocation")
+        center = spawn and spawn.Position or Vector3.new(0, 50, 0)
+    end
+    local function others()
+        local list = {}
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= player and plr.Character then
+                local hrp = plr.Character:FindFirstChild("HumanoidRootPart")
+                if hrp then table.insert(list, hrp.Position) end
+            end
+        end
+        return list
+    end
+    local bestSpot, bestMin = nil, -1
+    for _ = 1, SAFE_SEARCH_TRIES do
+        local angle = math.random() * math.pi * 2
+        local radius = math.random() * SAFE_SEARCH_RANGE
+        local candidate = center + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = {player.Character}
+        local hit = Workspace:Raycast(candidate + Vector3.new(0, 500, 0), Vector3.new(0, -1000, 0), params)
+        if hit then candidate = hit.Position end
+        local minDist = math.huge
+        for _, p in ipairs(others()) do
+            local d = (candidate - p).Magnitude
+            if d < minDist then minDist = d end
+        end
+        if minDist > bestMin then bestMin = minDist; bestSpot = candidate end
+        if minDist >= SAFE_MIN_DIST then break end
+    end
+    return bestSpot or center
+end
+
+local function enterSafeMode(reason, dangerPlr, dangerDist)
+    if inDangerMode then return end
+    inDangerMode = true
+    local msg = "DANGER"
+    if dangerPlr then
+        msg = msg .. " · " .. dangerPlr.Name .. " (" .. math.floor(dangerDist or 0) .. " studs)"
+    elseif reason then
+        msg = msg .. " · " .. reason
+    end
+    notify("PRIMAL EARTH", msg, 3)
+    unfreezePlayer()
+    local safePos = findSafeSpot()
+    if safePos then
+        rawTP(safePos)
+        RunService.Heartbeat:Wait()
+        rawTP(safePos)
+        for _ = 1, TP_SETTLE_FRAMES do RunService.Heartbeat:Wait() end
+        freezePlayer()
+    end
+    while inDangerMode and farming do
+        task.wait(SAFE_MONITOR_INTERVAL)
+        if isAllZonesClear() then
+            inDangerMode = false
+            notify("PRIMAL EARTH", "Zones clear · resume", 3)
+            return
+        end
+    end
+end
+
+local function holdZone(zone)
+    local pos = getZonePosition(zone)
+    if not pos then return false end
+
+    local danger, dangerPlr, dangerDist = isZoneDangerous(pos)
+    if danger then
+        enterSafeMode("zone contested", dangerPlr, dangerDist)
+        return false
+    end
+
+    unfreezePlayer()
+    for _ = 1, 2 do RunService.Heartbeat:Wait() end
+    rawTP(pos)
+    RunService.Heartbeat:Wait()
+    rawTP(pos)
+    for _ = 1, TP_SETTLE_FRAMES do RunService.Heartbeat:Wait() end
+
+    freezePlayer()
+
+    local elapsed = 0
+    local lastDangerCheck = 0
+
+    while elapsed < ZONE_HOLD_TIME and farming do
+        task.wait(ZONE_CHECK_TIME)
+        elapsed = elapsed + ZONE_CHECK_TIME
+
+        lastDangerCheck = lastDangerCheck + ZONE_CHECK_TIME
+        if lastDangerCheck >= ZONE_DANGER_CHECK then
+            lastDangerCheck = 0
+            local danger2, p2, d2 = isZoneDangerous(pos)
+            if danger2 then
+                enterSafeMode("approached", p2, d2)
+                return false
+            end
+        end
+
+        local hrp = getHRP()
+        if hrp and (hrp.Position - pos).Magnitude > 5 then
+            unfreezePlayer()
+            rawTP(pos)
+            for _ = 1, TP_SETTLE_FRAMES do RunService.Heartbeat:Wait() end
+            freezePlayer()
+        end
+
+        local state = checkZoneState(zone)
+        if state == "green" then
+            task.wait(GREEN_GRACE_TIME)
+            return true
+        end
+    end
+    return false
+end
+
+local function farmLoop()
+    while farming do
+        local zones = getAllZones()
+        if #zones == 0 then
+            notify("PRIMAL EARTH", "No zones found", 4)
+            farming = false
+            unfreezePlayer()
+            exitConflictMode()
+            return
+        end
+
+        local needsCapture = {}
+        local dangerZones = 0
+        for _, z in ipairs(zones) do
+            if checkZoneState(z) ~= "green" then
+                local pos = getZonePosition(z)
+                if pos and isZoneDangerous(pos) then
+                    dangerZones = dangerZones + 1
+                else
+                    table.insert(needsCapture, z)
+                end
+            end
+        end
+
+        if dangerZones > 0 then
+            enterSafeMode(dangerZones .. " zones contested")
+        elseif #needsCapture > 0 then
+            notify("PRIMAL EARTH", string.format("%d/%d need capture", #needsCapture, #zones), 3)
+            for i, zone in ipairs(needsCapture) do
+                if not farming then break end
+                if not inDangerMode and zone.Parent then
+                    unfreezePlayer()
+                    local ok = holdZone(zone)
+                    notify("PRIMAL EARTH", zone.Name .. (ok and " ✓" or " · timeout"), 2)
+                    unfreezePlayer()
+                end
+            end
+        else
+            notify("PRIMAL EARTH", "All captured · safe spot", 3)
+            local safePos = findSafeSpot()
+            if safePos then
+                unfreezePlayer()
+                rawTP(safePos)
+                RunService.Heartbeat:Wait()
+                rawTP(safePos)
+                for _ = 1, TP_SETTLE_FRAMES do RunService.Heartbeat:Wait() end
+                freezePlayer()
+
+                local t = 0
+                while t < SAFE_STAND_TIME and farming do
+                    task.wait(0.5); t = t + 0.5
+                    local danger, dp, dd = isZoneDangerous(safePos)
+                    if danger then
+                        unfreezePlayer()
+                        safePos = findSafeSpot()
+                        if safePos then
+                            rawTP(safePos)
+                            for _ = 1, TP_SETTLE_FRAMES do RunService.Heartbeat:Wait() end
+                            freezePlayer()
+                        end
+                    end
+                    local anyRed = false
+                    for _, z in ipairs(getAllZones()) do
+                        if checkZoneState(z) == "red" then anyRed = true; break end
+                    end
+                    if anyRed then break end
+                end
+
+                unfreezePlayer()
+            end
+            if farming then task.wait(1) end
+        end
+    end
+    unfreezePlayer()
+    exitConflictMode()
+end
+
+--============================================================
+-- LOCAL SAFE ZONE (Solid platform)
+--============================================================
+local function createSafeZonePart()
+    local old = Workspace:FindFirstChild(SAFE_ZONE_NAME)
+    if old then old:Destroy() end
+
+    local part = Instance.new("Part")
+    part.Name = SAFE_ZONE_NAME
+    part.Size = safeZoneSize
+    part.Anchored = true
+    part.CanCollide = true
+    part.CanQuery = true
+    part.CanTouch = true
+    part.CastShadow = false
+    part.Material = Enum.Material.SmoothPlastic
+    part.Color = Color3.fromRGB(60, 240, 120)
+    part.Transparency = 0.25
+    part.TopSurface = Enum.SurfaceType.Smooth
+    part.BottomSurface = Enum.SurfaceType.Smooth
+    part.CFrame = CFrame.new(0, SAFE_ZONE_SKY_Y, 0)
+    part.Parent = Workspace
+
+    task.defer(function()
+        if part and part.Parent then
+            part.CanCollide = true
+            part.CanQuery = true
+            part.CanTouch = true
+        end
+    end)
+
+    local bb = Instance.new("BillboardGui")
+    bb.Name = "Label"
+    bb.Size = UDim2.new(0, 200, 0, 50)
+    bb.StudsOffset = Vector3.new(0, safeZoneSize.Y/2 + 3, 0)
+    bb.AlwaysOnTop = true
+    bb.Parent = part
+
+    local txt = Instance.new("TextLabel")
+    txt.Size = UDim2.new(1, 0, 1, 0)
+    txt.BackgroundTransparency = 1
+    txt.Text = "SAFE ZONE"
+    txt.TextColor3 = Color3.fromRGB(60, 240, 120)
+    txt.TextStrokeTransparency = 0.3
+    txt.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+    txt.Font = Enum.Font.GothamBold
+    txt.TextScaled = true
+    txt.Parent = bb
+
+    safeZonePart = part
+    return part
+end
+
+local function destroySafeZonePart()
+    if safeZoneFollowConn then
+        safeZoneFollowConn:Disconnect()
+        safeZoneFollowConn = nil
+    end
+    safeZoneFollowOn = false
+    local p = Workspace:FindFirstChild(SAFE_ZONE_NAME)
+    if p then p:Destroy() end
+    safeZonePart = nil
+end
+
+local function saveGroundPos()
+    local hrp = getHRP()
+    if hrp then
+        lastGroundPos = hrp.Position
+    end
+end
+
+local function teleportToSafeZone(silent)
+    if not safeZonePart or not safeZonePart.Parent then
+        createSafeZonePart()
+    end
+    local hrp = getHRP()
+    if not hrp then
+        if not silent then notify("PRIMAL EARTH", "No character", 3) end
+        return false
+    end
+    saveGroundPos()
+    local look = hrp.CFrame.LookVector
+    local dest = safeZonePart.Position + Vector3.new(0, safeZoneSize.Y/2 + 4, 0)
+    hrp.CFrame = CFrame.lookAt(dest, dest + look)
+    if frozen then
+        frozenCF = hrp.CFrame
+    end
+    if not silent then
+        notify("PRIMAL EARTH", "Teleported to sky platform", 3)
+    end
+    return true
+end
+
+local function returnToGround()
+    if not lastGroundPos then
+        notify("PRIMAL EARTH", "No saved ground pos", 3)
+        return
+    end
+    local hrp = getHRP()
+    if hrp then
+        hrp.CFrame = CFrame.new(lastGroundPos + Vector3.new(0, 5, 0))
+        if frozen then
+            frozenCF = hrp.CFrame
+        end
+        notify("PRIMAL EARTH", "Returned to ground", 3)
+    end
+end
+
+local function moveSafeZoneHere()
+    if not safeZonePart or not safeZonePart.Parent then
+        createSafeZonePart()
+    end
+    local hrp = getHRP()
+    if hrp and safeZonePart then
+        safeZonePart.CFrame = CFrame.new(hrp.Position + Vector3.new(0, -safeZoneSize.Y/2 - 2, 0))
+        notify("PRIMAL EARTH", "Safe Zone platform placed under you", 3)
+    end
+end
+
+local function setSafeZoneFollow(state)
+    if safeZoneFollowConn then
+        safeZoneFollowConn:Disconnect()
+        safeZoneFollowConn = nil
+    end
+    safeZoneFollowOn = state
+    if not state then return end
+    if not safeZonePart or not safeZonePart.Parent then
+        createSafeZonePart()
+    end
+    safeZoneFollowConn = RunService.RenderStepped:Connect(function()
+        if not safeZonePart or not safeZonePart.Parent then return end
+        local hrp = getHRP()
+        if hrp then
+            safeZonePart.CFrame = CFrame.new(hrp.Position + Vector3.new(0, -safeZoneSize.Y/2 - 2, 0))
+        end
+    end)
+end
+
+--============================================================
+-- LOW HP → SAFE ZONE
+--============================================================
+local function lowHpLoop()
+    while lowHpWatch do
+        local hum = getHum()
+        if hum and hum.Health > 0 and hum.MaxHealth > 0 then
+            local pct = (hum.Health / hum.MaxHealth) * 100
+            if pct <= LOW_HP_THRESHOLD_PERCENT and not lowHpBusy then
+                if tick() - lastLowHpTP >= LOW_HP_COOLDOWN then
+                    lowHpBusy = true
+                    lastLowHpTP = tick()
+                    notify("PRIMAL EARTH",
+                        string.format("LOW HP %.0f%% · TP to Safe Zone", pct), 4)
+                    pcall(function() teleportToSafeZone(true) end)
+                    task.wait(0.5)
+                    lowHpBusy = false
+                end
+            end
+        end
+        task.wait(LOW_HP_CHECK_TIME)
+    end
+end
+
+--============================================================
+-- WINDOW
+--============================================================
+local Window = Rayfield:CreateWindow({
+    Name = "PRIMAL EARTH",
+    LoadingTitle = "PRIMAL EARTH",
+    LoadingSubtitle = "v7.3 · by RADEN",
+    ConfigurationSaving = { Enabled = true, FolderName = "PRIMAL_EARTH", FileName = "Config" },
+    KeySystem = false,
+})
+
+--============ FEATURE TAB ============
+local FeatureTab = Window:CreateTab("Feature", 4483362458)
+
+FeatureTab:CreateSection("★ Follow Player")
+
+local function getPlayerOptions()
+    local opts = {}
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= player then
+            table.insert(opts, plr.Name)
+        end
+    end
+    if #opts == 0 then opts = {"(no players)"} end
+    return opts
+end
+
+local pickDropdown
+
+pickDropdown = FeatureTab:CreateDropdown({
+    Name = "Target Player (Pick Only)",
+    Options = getPlayerOptions(),
+    CurrentOption = {},
+    Flag = "follow_target_picker",
+    Callback = function(option)
+        if not option or #option == 0 then return end
+        local targetName = option[1]
+        if targetName == "(no players)" then return end
+        local targetPlr = nil
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr.Name == targetName then
+                targetPlr = plr
+                break
+            end
+        end
+        if targetPlr and targetPlr ~= player then
+            followTarget = targetPlr
+            notify("PRIMAL EARTH", "Target dipilih: " .. targetPlr.DisplayName, 3)
+            print("[FOLLOW] Target set to: " .. targetPlr.Name)
+        else
+            notify("PRIMAL EARTH", "Player tidak ditemukan", 3)
+        end
+    end,
+})
+
+task.spawn(function()
+    while true do
+        task.wait(2)
+        local newOpts = getPlayerOptions()
+        pcall(function() pickDropdown:Refresh(newOpts) end)
+    end
+end)
+
+FeatureTab:CreateToggle({
+    Name = "★ Follow Enabled (Trigger)",
+    CurrentValue = false,
+    Flag = "follow_enabled",
+    Callback = function(state)
+        if state then
+            if not followTarget then
+                notify("PRIMAL EARTH", "Pilih target dulu di dropdown", 4)
+                return
+            end
+            startFollow(followTarget)
+        else
+            stopFollow()
+        end
+    end,
+})
+
+FeatureTab:CreateSlider({
+    Name = "Follow Distance (behind target)",
+    Range = {2, 40}, Increment = 1, Suffix = " studs",
+    CurrentValue = 6, Flag = "follow_dist",
+    Callback = function(v) followDistance = v end,
+})
+
+FeatureTab:CreateSlider({
+    Name = "Max Instant TP Distance",
+    Range = {5, 200}, Increment = 5, Suffix = " studs",
+    CurrentValue = 40, Flag = "follow_max_instant",
+    Callback = function(v) followMaxInstant = v end,
+})
+
+FeatureTab:CreateButton({
+    Name = "Stop Follow",
+    Callback = function() stopFollow() end,
+})
+
+FeatureTab:CreateButton({
+    Name = "Print Follow Status",
+    Callback = function()
+        local msg = "Follow: " .. (followEnabled and "ON" or "OFF")
+        if followTarget then msg = msg .. " · Target: " .. followTarget.Name
+        else msg = msg .. " · No target" end
+        msg = msg .. string.format(" · Dist: %d · MaxInstant: %d", followDistance, followMaxInstant)
+        notify("PRIMAL EARTH", msg, 5)
+        print("[FOLLOW STATUS]", msg)
+    end,
+})
+
+FeatureTab:CreateToggle({
+    Name = "Follow Debug (print F9)",
+    CurrentValue = false,
+    Flag = "follow_debug",
+    Callback = function(v)
+        followDebug = v
+        print("[FOLLOW] Debug: " .. tostring(v))
+    end,
+})
+
+FeatureTab:CreateSection("TPWalk")
+
+FeatureTab:CreateToggle({
+    Name = "Enable TPWalk",
+    CurrentValue = false,
+    Flag = "tpwalk_on",
+    Callback = function(state)
+        setEnabled(state)
+        if state then
+            notify("PRIMAL EARTH", "TPWalk ON · speed " .. value, 3)
+        else
+            notify("PRIMAL EARTH", "TPWalk OFF", 3)
+        end
+    end,
+})
+
+FeatureTab:CreateSlider({
+    Name = "TPWalk Speed",
+    Range = {1, 10}, Increment = 1, Suffix = "x",
+    CurrentValue = 5, Flag = "tpwalk_speed",
+    Callback = function(v) value = v end,
+})
+
+FeatureTab:CreateSection("TP Tool")
+
+FeatureTab:CreateToggle({
+    Name = "Enable TP Tool",
+    CurrentValue = false,
+    Flag = "tptool_on",
+    Callback = function(state)
+        tpToolOn = state
+        if tpToolOn then enableTPTool(); notify("PRIMAL EARTH", "TP Tool ON", 3)
+        else disableTPTool(); notify("PRIMAL EARTH", "TP Tool OFF", 3) end
+    end,
+})
+
+FeatureTab:CreateSlider({
+    Name = "TP Tool Drag Threshold (px)",
+    Range = {4, 40}, Increment = 1,
+    CurrentValue = 14, Flag = "tptool_drag",
+    Callback = function(v) TP_TOOL_THRESHOLD = v end,
+})
+
+FeatureTab:CreateSection("ESP")
+
+FeatureTab:CreateToggle({
+    Name = "ESP Enabled (All Features)",
+    CurrentValue = false,
+    Flag = "esp_on",
+    Callback = function(state)
+        espOn = state
+        if espOn then startEsp(); notify("PRIMAL EARTH", "ESP ON · all features active", 3)
+        else stopEsp(); notify("PRIMAL EARTH", "ESP OFF", 3) end
+    end,
+})
+
+FeatureTab:CreateToggle({
+    Name = "Team Check",
+    CurrentValue = false,
+    Flag = "esp_team",
+    Callback = function(v) espTeamOnly = v; if espOn then clearAllEsp() end end,
+})
+
+FeatureTab:CreateToggle({
+    Name = "Show Myself",
+    CurrentValue = false,
+    Flag = "esp_local",
+    Callback = function(v) espShowLocal = v; if espOn then clearAllEsp() end end,
+})
+
+--============ AUTO FARM ============
+local MainTab = Window:CreateTab("Auto Farm", 4483362458)
+
+MainTab:CreateSection("Zone Farming")
+MainTab:CreateToggle({
+    Name = "Auto Farm", CurrentValue = false, Flag = "auto_farm",
+    Callback = function(state)
+        farming = state
+        if farming then
+            if followEnabled then
+                followEnabled = false
+                followTarget = nil
+                notify("PRIMAL EARTH", "Follow off", 3)
+            end
+            enterConflictMode("farm")
+            local zones = getAllZones()
+            if #zones == 0 then
+                notify("PRIMAL EARTH", "No zones found!", 4)
+                farming = false
+                exitConflictMode()
+                return
+            end
+            notify("PRIMAL EARTH", "Auto Farm ON · " .. #zones .. " zones", 3)
+            farmThread = task.spawn(farmLoop)
+        else
+            notify("PRIMAL EARTH", "Auto Farm OFF", 3)
+            inDangerMode = false
+            if farmThread then task.cancel(farmThread); farmThread = nil end
+            unfreezePlayer()
+            exitConflictMode()
+        end
+    end,
+})
+MainTab:CreateSlider({
+    Name = "Max Wait Per Zone (s)", Range = {5, 60}, Increment = 1, Suffix = "s",
+    CurrentValue = 15, Flag = "zone_timeout",
+    Callback = function(v) ZONE_HOLD_TIME = v end,
+})
+MainTab:CreateSlider({
+    Name = "Safe Spot Stand Time (s)", Range = {5, 60}, Increment = 1, Suffix = "s",
+    CurrentValue = 15, Flag = "safe_time",
+    Callback = function(v) SAFE_STAND_TIME = v end,
+})
+
+MainTab:CreateSection("Zone Danger Detection")
+MainTab:CreateSlider({
+    Name = "Danger Radius (studs)", Range = {10, 200}, Increment = 5, Suffix = " studs",
+    CurrentValue = 50, Flag = "danger_radius",
+    Callback = function(v) ZONE_DANGER_DIST = v end,
+})
+
+MainTab:CreateButton({
+    Name = "Show All Zone States",
+    Callback = function()
+        local zones = getAllZones()
+        local g, r, u, d = 0, 0, 0, 0
+        for _, z in ipairs(zones) do
+            local s = checkZoneState(z)
+            if s == "green" then g = g + 1
+            elseif s == "red" then r = r + 1
+            else u = u + 1 end
+            local pos = getZonePosition(z)
+            if pos and isZoneDangerous(pos) then d = d + 1 end
+        end
+        notify("PRIMAL EARTH", string.format("G:%d R:%d U:%d · Danger:%d", g, r, u, d), 5)
+    end,
+})
+MainTab:CreateButton({
+    Name = "Manual Unfreeze",
+    Callback = function() unfreezePlayer(); notify("PRIMAL EARTH", "Unfrozen", 2) end,
+})
+
+MainTab:CreateSection("Safe Zone (Local · Solid Platform)")
+
+MainTab:CreateToggle({
+    Name = "★ Auto TP to Safe Zone when HP < 10%",
+    CurrentValue = false,
+    Flag = "lowhp_safezone",
+    Callback = function(state)
+        lowHpWatch = state
+        if lowHpWatch then
+            if not safeZonePart or not safeZonePart.Parent then
+                createSafeZonePart()
+            end
+            notify("PRIMAL EARTH", "Low HP guard ON · thr " .. LOW_HP_THRESHOLD_PERCENT .. "%", 3)
+            if not lowHpThread then
+                lowHpThread = task.spawn(function()
+                    lowHpLoop()
+                    lowHpThread = nil
+                end)
+            end
+        else
+            notify("PRIMAL EARTH", "Low HP guard OFF", 3)
+        end
+    end,
+})
+
+MainTab:CreateSlider({
+    Name = "Low HP Threshold (%)",
+    Range = {5, 50}, Increment = 1, Suffix = "%",
+    CurrentValue = 10, Flag = "lowhp_threshold",
+    Callback = function(v) LOW_HP_THRESHOLD_PERCENT = v end,
+})
+
+MainTab:CreateButton({
+    Name = "Create / Reset Safe Zone Platform",
+    Callback = function()
+        createSafeZonePart()
+        notify("PRIMAL EARTH", "Solid platform spawned at Y=" .. SAFE_ZONE_SKY_Y, 4)
+    end,
+})
+
+MainTab:CreateButton({
+    Name = "Teleport to Safe Zone",
+    Callback = function()
+        teleportToSafeZone()
+    end,
+})
+
+MainTab:CreateButton({
+    Name = "Return to Ground",
+    Callback = function()
+        returnToGround()
+    end,
+})
+
+MainTab:CreateButton({
+    Name = "Place Platform Under Me",
+    Callback = function()
+        moveSafeZoneHere()
+    end,
+})
+
+MainTab:CreateButton({
+    Name = "Destroy Safe Zone Part",
+    Callback = function()
+        destroySafeZonePart()
+        notify("PRIMAL EARTH", "Safe Zone destroyed", 3)
+    end,
+})
+
+MainTab:CreateToggle({
+    Name = "Safe Zone · Follow Me (below feet)",
+    CurrentValue = false,
+    Flag = "safezone_follow",
+    Callback = function(state)
+        setSafeZoneFollow(state)
+        notify("PRIMAL EARTH", "Safe Zone follow: " .. (state and "ON" or "OFF"), 3)
+    end,
+})
+
+MainTab:CreateSlider({
+    Name = "Safe Zone Size X/Z",
+    Range = {2, 30}, Increment = 1, Suffix = " studs",
+    CurrentValue = 5, Flag = "safezone_size_xz",
+    Callback = function(v)
+        safeZoneSize = Vector3.new(v, safeZoneSize.Y, v)
+        if safeZonePart and safeZonePart.Parent then
+            safeZonePart.Size = safeZoneSize
+        end
+    end,
+})
+
+MainTab:CreateSlider({
+    Name = "Safe Zone Height",
+    Range = {1, 20}, Increment = 1, Suffix = " studs",
+    CurrentValue = 2, Flag = "safezone_size_y",
+    Callback = function(v)
+        safeZoneSize = Vector3.new(safeZoneSize.X, v, safeZoneSize.Z)
+        if safeZonePart and safeZonePart.Parent then
+            safeZonePart.Size = safeZoneSize
+        end
+    end,
+})
+
+--============ HUNGER ============
+local HungerTab = Window:CreateTab("Hunger", 4483362458)
+
+HungerTab:CreateSection("Auto Eat")
+HungerTab:CreateToggle({
+    Name = "Auto Eat (watch hunger)", CurrentValue = false, Flag = "auto_eat",
+    Callback = function(state)
+        hungerWatch = state
+        if hungerWatch then
+            hungerRef = nil; maxHungerRef = nil; cachedMaxHunger = nil
+            local h = readHunger()
+            if h == nil then
+                notify("PRIMAL EARTH", "Hunger value not found", 5)
+                hungerWatch = false; return
+            end
+            local max = readMaxHunger()
+            notify("PRIMAL EARTH", string.format("Auto Eat ON · %d/%d", math.floor(h), math.floor(max)), 4)
+            hungerThread = task.spawn(hungerLoop)
+        else
+            notify("PRIMAL EARTH", "Auto Eat OFF", 3)
+            if hungerThread then task.cancel(hungerThread); hungerThread = nil end
+        end
+    end,
+})
+HungerTab:CreateSlider({
+    Name = "Start Eating Below", Range = {5, 200}, Increment = 1,
+    CurrentValue = 30, Flag = "hunger_thresh",
+    Callback = function(v) HUNGER_THRESHOLD = v end,
+})
+HungerTab:CreateSlider({
+    Name = "Fallback Target", Range = {10, 200}, Increment = 1,
+    CurrentValue = 95, Flag = "hunger_target_fallback",
+    Callback = function(v) HUNGER_TARGET_SLIDER = v end,
+})
+HungerTab:CreateButton({
+    Name = "Eat Now",
+    Callback = function() task.spawn(function() eatUntilFull() end) end,
+})
+HungerTab:CreateButton({
+    Name = "Read Hunger / Max",
+    Callback = function()
+        hungerRef = nil; maxHungerRef = nil; cachedMaxHunger = nil
+        local h = readHunger()
+        local m = readMaxHunger()
+        if h then
+            notify("PRIMAL EARTH", string.format("Hunger: %d / %d", math.floor(h), math.floor(m)), 5)
+        else
+            notify("PRIMAL EARTH", "Hunger NOT found", 5)
+        end
+    end,
+})
+
+--============ CREDITS TAB ============
+local CreditTab = Window:CreateTab("Credits", 4483362458)
+
+CreditTab:CreateSection("About")
+
+CreditTab:CreateParagraph({
+    Title = "PRIMAL EARTH",
+    Content = "Version 7.3 · A hub script for Primal Earth on Roblox. Provides TPWalk, TP Tool, Follow, ESP, Auto Farm, Auto Eat, and a local Safe Zone platform.",
+})
+
+CreditTab:CreateParagraph({
+    Title = "Made By",
+    Content = "RADEN",
+})
+
+CreditTab:CreateParagraph({
+    Title = "Assisted By",
+    Content = "Grok",
+})
+
+CreditTab:CreateParagraph({
+    Title = "UI Framework",
+    Content = "Rayfield (v1)",
+})
+
+CreditTab:CreateParagraph({
+    Title = "Features",
+    Content = "TPWalk · TP Tool · Follow Player · ESP (Highlight, Glow, Name, Distance, HP, Tracer, Corners, Head Dot — all active on ESP toggle) · Auto Farm · Zone Capture · Danger Detection · Safe Spot Finder · Auto Eat · Local Safe Zone Platform · Low HP Auto-TP Guard",
+})
+
+CreditTab:CreateSection("Safety Notice")
+
+CreditTab:CreateParagraph({
+    Title = "Local-Only Features",
+    Content = "Safe Zone platform is created client-side only. No server replication. No other player can see it.",
+})
+
+CreditTab:CreateParagraph({
+    Title = "Stay Safe",
+    Content = "Use at your own risk. Respect other players. Don't ruin public servers.",
+})
+
+--============ DIAGNOSTICS ============
+MainTab:CreateSection("Diagnostics")
+MainTab:CreateButton({
+    Name = "Recreate UI (if invisible)",
+    Callback = function()
+        notify("PRIMAL EARTH", "If UI vanished, re-execute the script", 5)
+    end,
+})
+
+--============================================================
+-- RESPAWN
+--============================================================
+player.CharacterAdded:Connect(function()
+    if lockConn then lockConn:Disconnect(); lockConn = nil end
+    frozen = false; frozenCF = nil
+    savedSpeed, savedJumpPow, savedJumpH = nil, nil, nil
+    hungerRef = nil; maxHungerRef = nil; cachedMaxHunger = nil
+    inDangerMode = false
+    lowHpBusy = false
+    lastLowHpTP = 0
+    clearAllEsp()
+    task.wait(1.5)
+    if enabled then
+        tpwalkConnect()
+    end
+end)
+
+player.ChildAdded:Connect(function(child)
+    if child.Name == "StatsFolder" then
+        hungerRef = nil; maxHungerRef = nil; cachedMaxHunger = nil
+    end
+end)
+
+Players.PlayerRemoving:Connect(function(plr)
+    if plr == followTarget then
+        notify("PRIMAL EARTH", "Follow target left", 3)
+        followEnabled = false
+        followTarget = nil
+    end
+end)
+
+notify("PRIMAL EARTH", "v7.3 loaded · by RADEN", 5)
